@@ -16,7 +16,9 @@ import hashlib
 import math
 import random
 
-from app.core.ml.model import CLASS_NAMES
+# Kept in sync with app.core.ml.model.CLASS_NAMES. Defined here so the
+# simulation-mode API path doesn't import torch (needed for serverless deploys).
+CLASS_NAMES = ["open_water", "crude_oil", "heavy_fuel_oil", "look_alike", "ship", "land"]
 from app.core.physics.gate import evaluate_physics_gate
 from app.models import ClassProbabilities, EnvironmentalConditions, OilClass, ReliabilityBlock
 
