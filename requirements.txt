@@ -1,0 +1,10 @@
+# Vercel serverless runtime only. torch/torchvision/rasterio are left out:
+# they exceed Vercel's function size limit and the API runs in SIMULATION_MODE.
+# scipy/pillow are only used by the real-SAR ingest path, which needs rasterio.
+# Local/full installs still use backend/requirements.txt.
+fastapi==0.115.0
+pydantic==2.9.2
+numpy==1.26.4
+shapely==2.0.6
+python-multipart==0.0.9
+reportlab==4.2.5
