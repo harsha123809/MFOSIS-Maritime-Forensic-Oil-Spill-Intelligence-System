@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import math
 import shutil
 import uuid
@@ -240,15 +241,34 @@ class AnalyseRequest(BaseModel):
     force_wind_speed_ms: float | None = None
 
 
-@router.post("/scenes/{scene_id}/analyse", response_model=Detection)
-def analyse_scene(scene_id: str, req: AnalyseRequest = AnalyseRequest()):
-    scene = store.get_scene(scene_id)
-    if scene is None:
-        raise HTTPException(status_code=404, detail="Scene not found")
+def _detection_id(scene_id: str, apply_physics_gate: bool, force_wind_speed_ms: float | None) -> str:
+    """Deterministic ID that encodes the analyse inputs.
 
+    Inference is seeded by scene_id, so the same inputs always yield the same
+    detection. Encoding them in the ID lets any process rebuild a detection it
+    never saw — required on serverless hosts (Vercel), where consecutive
+    requests can land on different instances with empty in-memory stores.
+    """
+    wind = "na" if force_wind_speed_ms is None else repr(float(force_wind_speed_ms))
+    return f"det-{scene_id}~g{int(apply_physics_gate)}~w{wind}"
+
+
+def _parse_detection_id(detection_id: str) -> tuple[str, bool, float | None] | None:
+    try:
+        body = detection_id.removeprefix("det-")
+        scene_id, g, w = body.rsplit("~", 2)
+        if not (g.startswith("g") and w.startswith("w")):
+            return None
+        wind = None if w[1:] == "na" else float(w[1:])
+        return scene_id, g[1:] == "1", wind
+    except ValueError:
+        return None
+
+
+def _build_detection(scene, apply_physics_gate: bool, force_wind_speed_ms: float | None) -> Detection:
     env = scene.environment
-    if req.force_wind_speed_ms is not None:
-        env = env.model_copy(update={"wind_speed_ms": req.force_wind_speed_ms})
+    if force_wind_speed_ms is not None:
+        env = env.model_copy(update={"wind_speed_ms": force_wind_speed_ms})
 
     result = run_inference(
         scene.id, scene.scenario_tag, env, scene.bbox,
@@ -257,7 +277,7 @@ def analyse_scene(scene_id: str, req: AnalyseRequest = AnalyseRequest()):
 
     # Turning the gate off shows raw model output; it cannot conjure a
     # classification where none exists, so a real SAR scene stays UNRESOLVED.
-    if not req.apply_physics_gate and not scene.is_real_sar:
+    if not apply_physics_gate and not scene.is_real_sar:
         # Raw, unfiltered model output — the UI must show a warning banner
         # alongside this. We recompute probabilities without the gate's
         # confidence multiplier by re-running with an always-optimal gate
@@ -268,8 +288,8 @@ def analyse_scene(scene_id: str, req: AnalyseRequest = AnalyseRequest()):
         result["class_probabilities"] = raw["class_probabilities"]
         result["predicted_class"] = raw["predicted_class"]
 
-    detection = Detection(
-        id=f"det-{uuid.uuid4().hex[:10]}",
+    return Detection(
+        id=_detection_id(scene.id, apply_physics_gate, force_wind_speed_ms),
         scene_id=scene.id,
         predicted_class=result["predicted_class"],
         class_probabilities=result["class_probabilities"],
@@ -284,17 +304,57 @@ def analyse_scene(scene_id: str, req: AnalyseRequest = AnalyseRequest()):
         classification_available=result.get("classification_available", True),
         classification_note=result.get("classification_note"),
     )
+
+
+def _save_new(detection: Detection) -> Incident:
     store.save_detection(detection)
+    incident = store.get_incident(f"inc-{detection.id}")
+    if incident is None:
+        incident = Incident(
+            id=f"inc-{detection.id}",
+            scene_id=detection.scene_id,
+            detection_id=detection.id,
+            status="OPEN",
+            created_at=dt.datetime.utcnow().isoformat() + "Z",
+        )
+        store.save_incident(incident)
+    return incident
 
-    incident = Incident(
-        id=f"inc-{detection.id}",
-        scene_id=scene.id,
-        detection_id=detection.id,
-        status="OPEN",
-        created_at=dt.datetime.utcnow().isoformat() + "Z",
-    )
-    store.save_incident(incident)
 
+def _rebuild_from_detection_id(detection_id: str) -> Detection | None:
+    """Recreate a detection (and its incident) this process has no record of."""
+    parsed = _parse_detection_id(detection_id)
+    if parsed is None:
+        return None
+    scene_id, gate, wind = parsed
+    scene = store.get_scene(scene_id)
+    if scene is None or scene.is_real_sar:  # uploaded scenes can't be rebuilt
+        return None
+    detection = _build_detection(scene, gate, wind)
+    _save_new(detection)
+    return detection
+
+
+def _get_detection(detection_id: str) -> Detection | None:
+    return store.get_detection(detection_id) or _rebuild_from_detection_id(detection_id)
+
+
+def _get_incident(incident_id: str) -> Incident | None:
+    incident = store.get_incident(incident_id)
+    if incident is None and incident_id.startswith("inc-"):
+        if _rebuild_from_detection_id(incident_id.removeprefix("inc-")) is not None:
+            incident = _get_incident(incident_id)
+    return incident
+
+
+@router.post("/scenes/{scene_id}/analyse", response_model=Detection)
+def analyse_scene(scene_id: str, req: AnalyseRequest = AnalyseRequest()):
+    scene = store.get_scene(scene_id)
+    if scene is None:
+        raise HTTPException(status_code=404, detail="Scene not found")
+
+    detection = _build_detection(scene, req.apply_physics_gate, req.force_wind_speed_ms)
+    _save_new(detection)
     return detection
 
 
@@ -328,7 +388,7 @@ def list_detections(
 
 @router.get("/detections/{detection_id}", response_model=Detection)
 def get_detection(detection_id: str):
-    d = store.get_detection(detection_id)
+    d = _get_detection(detection_id)
     if d is None:
         raise HTTPException(status_code=404, detail="Detection not found")
     return d
@@ -345,10 +405,10 @@ class BacktrackRequest(BaseModel):
 
 @router.post("/incidents/{incident_id}/backtrack")
 def backtrack_incident(incident_id: str, req: BacktrackRequest):
-    incident = store.get_incident(incident_id)
+    incident = _get_incident(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    detection = store.get_detection(incident.detection_id)
+    detection = _get_detection(incident.detection_id)
     scene = store.get_scene(incident.scene_id)
     if detection is None or scene is None:
         raise HTTPException(status_code=404, detail="Underlying detection/scene missing")
@@ -360,7 +420,7 @@ def backtrack_incident(incident_id: str, req: BacktrackRequest):
         hours=req.hours,
         particle_count=req.particle_count,
         acquisition_time=scene.acquisition_time,
-        seed=hash(incident_id) % (2**32),
+        seed=int(hashlib.sha256(incident_id.encode()).hexdigest(), 16) % (2**32),
     )
 
     from app.models import BacktrackResult
@@ -374,10 +434,10 @@ def backtrack_incident(incident_id: str, req: BacktrackRequest):
 
 @router.get("/incidents/{incident_id}/attribution")
 def get_attribution(incident_id: str):
-    incident = store.get_incident(incident_id)
+    incident = _get_incident(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    detection = store.get_detection(incident.detection_id)
+    detection = _get_detection(incident.detection_id)
     scene = store.get_scene(incident.scene_id)
     if detection is None or scene is None:
         raise HTTPException(status_code=404, detail="Underlying detection/scene missing")
@@ -399,10 +459,10 @@ def get_attribution(incident_id: str):
 
 @router.get("/incidents/{incident_id}/evidence")
 def get_evidence(incident_id: str, format: str = Query("json", pattern="^(json|pdf)$")):
-    incident = store.get_incident(incident_id)
+    incident = _get_incident(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    detection = store.get_detection(incident.detection_id)
+    detection = _get_detection(incident.detection_id)
     scene = store.get_scene(incident.scene_id)
     if detection is None or scene is None:
         raise HTTPException(status_code=404, detail="Underlying detection/scene missing")
@@ -424,7 +484,7 @@ class StatusUpdateRequest(BaseModel):
 
 @router.patch("/incidents/{incident_id}/status", response_model=Incident)
 def update_incident_status(incident_id: str, req: StatusUpdateRequest):
-    incident = store.get_incident(incident_id)
+    incident = _get_incident(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     if req.status not in ("CONFIRMED", "FALSE_POSITIVE", "OPEN"):
@@ -441,7 +501,7 @@ def list_incidents():
 
 @router.get("/incidents/{incident_id}", response_model=Incident)
 def get_incident(incident_id: str):
-    incident = store.get_incident(incident_id)
+    incident = _get_incident(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     return incident
